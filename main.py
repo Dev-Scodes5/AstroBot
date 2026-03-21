@@ -78,10 +78,10 @@ def simplify_with_llm(technical_text: str) -> str:
 @bot.command(name='apod')
 async def apod_command(ctx):
     """Fetches the Astronomy Picture of the Day and explains it."""
-    # 1. Let the user know the bot is "thinking"
+    # Let the user know the bot is "thinking"
     async with ctx.typing():
         
-        # 2. Fetch data from NASA
+        # Fetch data from NASA
         url = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}"
         nasa_data = await fetch_nasa_data(url)
         
@@ -93,20 +93,29 @@ async def apod_command(ctx):
         raw_explanation = nasa_data.get('explanation', '')
         image_url = nasa_data.get('url', '')
 
-        # 3. Process the text through the LLM
+        # Process the text through the LLM
         simplified_explanation = simplify_with_llm(raw_explanation)
 
-        # 4. Format the output into a clean UI (Discord Embed)
+        # Format the output into a clean UI (Discord Embed)
         embed = discord.Embed(
             title=f"🌌 {title}",
             description=simplified_explanation,
-            color=discord.Color.blue()
+            color=0xFC3D21 # Official NASA bright red
         )
+        
+        # Add the NASA logo to the top right
+        embed.set_thumbnail(url="https://www.nasa.gov/wp-content/uploads/2023/03/nasa-logo-web-rgb.png")
+        # Attach the actual space image to the bottom
         embed.set_image(url=image_url)
-        embed.set_footer(text="Data: NASA APOD API | Translation: AI")
 
-    # 5. Send the final result
-    await ctx.send(embed=embed)
+        # Add a professional footer
+        embed.set_footer(
+            text="Data: NASA APOD API | Translation: Gemini AI", 
+            icon_url="https://cdn-icons-png.flaticon.com/512/2906/2906496.png" # Small robot icon
+        )
+
+        # Send the final result
+        await ctx.send(embed=embed)
 
 # Run the application
 if __name__ == '__main__':
