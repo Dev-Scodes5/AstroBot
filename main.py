@@ -39,9 +39,10 @@ class AstroBot(commands.Bot):
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def setup_hook(self) -> None:
-        """Initialize aiohttp session on startup."""
+        """Initialize session and load cogs."""
         self.session = aiohttp.ClientSession()
-        logger.info("Bot session initialized")
+        await self.load_extension('cogs.space_systems')
+        logger.info("Cogs loaded")
 
     async def close(self) -> None:
         """Gracefully close the session."""
