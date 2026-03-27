@@ -1,125 +1,137 @@
 import discord
 from discord.ext import commands
 import aiohttp
+import asyncio
+import logging
 import os
+from typing import Optional
 from google import genai
 from dotenv import load_dotenv
 
-# Load environment variables from the .env file
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 NASA_API_KEY = os.getenv('NASA_API_KEY', 'DEMO_KEY')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GEMINI_MODEL = 'gemini-2.0-flash'
 
-# Configure the LLM Client
+# Configure LLM client
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Constants
+NASA_TIMEOUT = aiohttp.ClientTimeout(total=10)
+LLM_SYSTEM_PROMPT = """
+You are an enthusiastic astrophysics communicator for high schoolers.
+Take the following highly technical description from NASA and summarize it
+in 2-3 engaging, easy-to-understand paragraphs. Keep it fun but scientifically accurate.
+"""
 
 class AstroBot(commands.Bot):
     def __init__(self):
-        # Set up intents (required by Discord to read messages)
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix='!', intents=intents)
-        
-        # We will create an aiohttp session when the bot starts
-        self.session = None
+        self.session: Optional[aiohttp.ClientSession] = None
 
-    async def setup_hook(self):
-        "This runs once when the bot starts up. Good for initializing web sessions."
+    async def setup_hook(self) -> None:
+        """Initialize aiohttp session on startup."""
         self.session = aiohttp.ClientSession()
+        logger.info("Bot session initialized")
 
-    async def close(self):
-        "Ensures the web session closes cleanly if the bot shuts down."
+    async def close(self) -> None:
+        """Gracefully close the session."""
         if self.session:
             await self.session.close()
         await super().close()
 
-    async def on_ready(self):
-        print(f'Logged in as {self.user} (ID: {self.user.id})')
-        print('------')
+    async def on_ready(self) -> None:
+        logger.info(f'Logged in as {self.user} (ID: {self.user.id})')
 
-# Instantiate the bot
+# Instantiate bot
 bot = AstroBot()
 
-async def fetch_nasa_data(url: str):
-    "Handles the asynchronous HTTP request to NASA with error handling."
+async def fetch_nasa_data(url: str) -> Optional[dict]:
+    """Fetch JSON from NASA API with error handling and timeout."""
+    if not bot.session:
+        logger.error("Session not initialized")
+        return None
+    
     try:
-        async with bot.session.get(url) as response:
+        async with bot.session.get(url, timeout=NASA_TIMEOUT) as response:
             if response.status == 200:
                 return await response.json()
             else:
+                logger.warning(f"NASA API returned {response.status}")
                 return None
+    except asyncio.TimeoutError:
+        logger.error("NASA request timeout")
+        return None
     except Exception as e:
-        print(f"Network error: {e}")
+        logger.exception(f"Error fetching NASA data: {e}")
         return None
 
-def simplify_with_llm(technical_text: str) -> str:
-    "Passes the raw text to the LLM for simplification."
-    prompt = f"""
-    You are an enthusiastic astrophysics communicator for high schoolers. 
-    Take the following highly technical description from NASA and summarize it 
-    in 2-3 engaging, easy to understand paragraphs. Keep it fun but scientifically accurate.
-    
-    Raw text: {technical_text}
+async def simplify_with_llm(technical_text: str) -> str:
     """
+    Pass raw text to Gemini for simplification.
+    Runs in thread pool to avoid blocking the event loop.
+    """
+    prompt = f"{LLM_SYSTEM_PROMPT}\n\nRaw text:\n{technical_text}"
+    
     try:
-        response = gemini_client.models.generate_content(
-            model='gemini-2.5-flash',
+        # Run blocking LLM call in thread pool
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=GEMINI_MODEL,
             contents=prompt,
         )
         return response.text
     except Exception as e:
-        print(f"LLM Error: {e}")
-        return "Sorry, my AI brain is a bit fuzzy right now. Could not translate the data!"
-
-# Bot Command to fetch and explain the Astronomy Picture of the Day
+        logger.exception(f"LLM error: {e}")
+        return "Sorry, my AI brain is fuzzy right now. Could not translate the data!"
 
 @bot.command(name='apod')
-async def apod_command(ctx):
-    """Fetches the Astronomy Picture of the Day and explains it."""
-    # Let the user know the bot is "thinking"
+async def apod_command(ctx: commands.Context) -> None:
+    """Fetch and explain the Astronomy Picture of the Day."""
     async with ctx.typing():
-        
-        # Fetch data from NASA
+        # Fetch data
         url = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}"
         nasa_data = await fetch_nasa_data(url)
         
         if not nasa_data:
             await ctx.send("🚨 Houston, we have a problem reaching NASA's databases right now.")
             return
-
+        
         title = nasa_data.get('title', 'Unknown Title')
         raw_explanation = nasa_data.get('explanation', '')
         image_url = nasa_data.get('url', '')
-
-        # Process the text through the LLM
-        simplified_explanation = simplify_with_llm(raw_explanation)
-
-        # Format the output into a clean UI (Discord Embed)
+        
+        # Simplify via LLM (non-blocking)
+        simplified_explanation = await simplify_with_llm(raw_explanation)
+        
+        # Format output
         embed = discord.Embed(
             title=f"🌌 {title}",
             description=simplified_explanation,
-            color=0xFC3D21 # Official NASA bright red
+            color=discord.Color.from_rgb(252, 61, 33)  # NASA red
+        )
+        embed.set_thumbnail(url="https://www.nasa.gov/wp-content/uploads/2023/03/nasa-logo-web-rgb.png")
+        embed.set_image(url=image_url)
+        embed.set_footer(
+            text="Data: NASA APOD API | Translation: Gemini AI",
+            icon_url="https://cdn-icons-png.flaticon.com/512/2906/2906496.png"
         )
         
-        # Add the NASA logo to the top right
-        embed.set_thumbnail(url="https://www.nasa.gov/wp-content/uploads/2023/03/nasa-logo-web-rgb.png")
-        # Attach the actual space image to the bottom
-        embed.set_image(url=image_url)
-
-        # Add a professional footer
-        embed.set_footer(
-            text="Data: NASA APOD API | Translation: Gemini AI", 
-            icon_url="https://cdn-icons-png.flaticon.com/512/2906/2906496.png" # Small robot icon
-        )
-
-        # Send the final result
         await ctx.send(embed=embed)
 
-# Run the application
 if __name__ == '__main__':
     if not DISCORD_TOKEN:
-        print("ERROR: Please set your DISCORD_TOKEN in the .env file.")
-    else:
-        bot.run(DISCORD_TOKEN)
+        logger.error("ERROR: DISCORD_TOKEN not set in .env")
+        exit(1)
+    
+    logger.info("Starting AstroBot...")
+    bot.run(DISCORD_TOKEN)
