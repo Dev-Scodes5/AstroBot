@@ -115,10 +115,10 @@ class RateLimiter:
         return max(0, remaining.total_seconds())
 
 def with_rate_limit(limiter: RateLimiter):
-    """Decorator to enforce per-user rate limiting."""
+    """Decorator to enforce per-user rate limiting (fixed for functions, not methods)."""
     def decorator(func):
         @wraps(func)
-        async def wrapper(self, ctx: commands.Context, *args, **kwargs):
+        async def wrapper(ctx: commands.Context, *args, **kwargs):  # ✓ FIXED: No 'self'
             user_id = ctx.author.id
             if limiter.is_on_cooldown(user_id):
                 remaining = limiter.remaining(user_id)
@@ -126,9 +126,9 @@ def with_rate_limit(limiter: RateLimiter):
                     f"⏱️ Slow down! Try again in {remaining:.1f} seconds.",
                     delete_after=5
                 )
-                raise RateLimitError(f"User {user_id} rate-limited")
+                return  # Don't raise, just return
             limiter.apply(user_id)
-            return await func(self, ctx, *args, **kwargs)
+            return await func(ctx, *args, **kwargs)
         return wrapper
     return decorator
 
