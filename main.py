@@ -18,7 +18,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 NASA_API_KEY = os.getenv('NASA_API_KEY', 'DEMO_KEY')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GEMINI_MODEL = 'gemini-2.0-flash'
+GEMINI_MODEL = 'gemini-1.5-flash'
 
 # Configure LLM client
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -39,10 +39,16 @@ class AstroBot(commands.Bot):
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def setup_hook(self) -> None:
-        """Initialize session and load cogs."""
+        """Initialize aiohttp session on startup."""
         self.session = aiohttp.ClientSession()
-        await self.load_extension('cogs.space_systems')
-        logger.info("Cogs loaded")
+        logger.info("Bot session initialized")
+        
+        # Load the Space Systems Cog
+        try:
+            await self.load_extension('cogs.space_systems')
+            logger.info("Loaded extension: space_systems")
+        except Exception as e:
+            logger.exception(f"Failed to load extension space_systems: {e}")
 
     async def close(self) -> None:
         """Gracefully close the session."""
