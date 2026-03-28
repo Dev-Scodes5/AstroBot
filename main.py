@@ -106,16 +106,19 @@ async def apod_command(ctx: commands.Context) -> None:
     """Fetch and explain the Astronomy Picture of the Day."""
     async with ctx.typing():
         # Fetch data
-        url = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}"
+        url = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}&count=1"
         nasa_data = await fetch_nasa_data(url)
         
         if not nasa_data:
             await ctx.send("🚨 Houston, we have a problem reaching NASA's databases right now.")
             return
+            
+        # Because we used 'count', NASA returns a list. We grab the first item.
+        if isinstance(nasa_data, list):
+            nasa_data = nasa_data[0]
         
         title = nasa_data.get('title', 'Unknown Title')
         raw_explanation = nasa_data.get('explanation', '')
-        image_url = nasa_data.get('url', '')
         
         # Simplify via LLM (non-blocking)
         simplified_explanation = await simplify_with_llm(raw_explanation)
