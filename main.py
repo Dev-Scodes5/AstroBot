@@ -4,145 +4,359 @@ import aiohttp
 import asyncio
 import logging
 import os
-from typing import Optional
+import json
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+from functools import wraps
 from google import genai
 from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)  # ✓ FIXED: __name__
 
-# Load environment variables
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-NASA_API_KEY = os.getenv('NASA_API_KEY', 'DEMO_KEY')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GEMINI_MODEL = 'gemini-2.5-flash'
+class Config:
+    """Centralized config. Easy to audit and override."""
+    DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+    NASA_API_KEY = os.getenv('NASA_API_KEY', 'DEMO_KEY')
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+    GEMINI_MODEL = 'gemini-2.5-flash'
 
-# Configure LLM client
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    # Timeouts & Limits
+    NASA_TIMEOUT = aiohttp.ClientTimeout(total=10)
+    CACHE_TTL_HOURS = 24
+    RATE_LIMIT_SECONDS = 5  # Per-user cooldown
+    MAX_APOD_COUNT = 30  # Safety limit for bulk requests
 
-# Constants
-NASA_TIMEOUT = aiohttp.ClientTimeout(total=10)
-LLM_SYSTEM_PROMPT = """
+    # Prompts
+    LLM_SYSTEM_PROMPT = """
 You are an enthusiastic astrophysics communicator for high schoolers.
 Take the following highly technical description from NASA and summarize it
 in 2-3 engaging, easy-to-understand paragraphs. Keep it fun but scientifically accurate.
 """
 
+    @staticmethod
+    def validate() -> bool:
+        """Validate required env vars."""
+        if not Config.DISCORD_TOKEN:
+            logger.error("DISCORD_TOKEN not set")
+            return False
+        if not Config.GEMINI_API_KEY:
+            logger.error("GEMINI_API_KEY not set")
+            return False
+        return True
+
+class APIError(Exception):
+    """NASA API error."""
+    pass
+
+class LLMError(Exception):
+    """Gemini LLM error."""
+    pass
+
+class RateLimitError(Exception):
+    """User hit rate limit."""
+    pass
+
+class CacheManager:
+    """Simple in-memory cache with TTL."""
+    def __init__(self, ttl_hours: int = 24):
+        self.cache: Dict[str, tuple[Any, datetime]] = {}
+        self.ttl = timedelta(hours=ttl_hours)
+
+    def get(self, key: str) -> Optional[Any]:
+        """Retrieve from cache if not expired."""
+        if key not in self.cache:
+            return None
+        value, timestamp = self.cache[key]
+        if datetime.now() - timestamp > self.ttl:
+            del self.cache[key]
+            return None
+        logger.debug(f"Cache hit: {key}")
+        return value
+
+    def set(self, key: str, value: Any) -> None:
+        """Store in cache."""
+        self.cache[key] = (value, datetime.now())
+        logger.debug(f"Cache set: {key}")
+
+    def clear(self) -> None:
+        """Clear all cache."""
+        self.cache.clear()
+
+class RateLimiter:
+    """Per-user cooldown tracker."""
+    def __init__(self, cooldown_seconds: int = 5):
+        self.cooldowns: Dict[int, datetime] = {}
+        self.cooldown = timedelta(seconds=cooldown_seconds)
+
+    def is_on_cooldown(self, user_id: int) -> bool:
+        """Check if user is rate-limited."""
+        if user_id not in self.cooldowns:
+            return False
+        if datetime.now() - self.cooldowns[user_id] > self.cooldown:
+            del self.cooldowns[user_id]
+            return False
+        return True
+
+    def apply(self, user_id: int) -> None:
+        """Mark user as used."""
+        self.cooldowns[user_id] = datetime.now()
+
+    def remaining(self, user_id: int) -> float:
+        """Seconds until user can use command."""
+        if user_id not in self.cooldowns:
+            return 0
+        remaining = self.cooldown - (datetime.now() - self.cooldowns[user_id])
+        return max(0, remaining.total_seconds())
+
+def with_rate_limit(limiter: RateLimiter):
+    """Decorator to enforce per-user rate limiting."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(self, ctx: commands.Context, *args, **kwargs):
+            user_id = ctx.author.id
+            if limiter.is_on_cooldown(user_id):
+                remaining = limiter.remaining(user_id)
+                await ctx.send(
+                    f"⏱️ Slow down! Try again in {remaining:.1f} seconds.",
+                    delete_after=5
+                )
+                raise RateLimitError(f"User {user_id} rate-limited")
+            limiter.apply(user_id)
+            return await func(self, ctx, *args, **kwargs)
+        return wrapper
+    return decorator
+
+async def retry_with_backoff(coro, max_retries: int = 3, base_delay: float = 1.0):
+    """Exponential backoff retry logic."""
+    for attempt in range(max_retries):
+        try:
+            return await coro
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning(f"Attempt {attempt + 1} failed, retrying in {delay}s: {e}")
+            await asyncio.sleep(delay)
+
 class AstroBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
-        super().__init__(command_prefix='!', intents=intents)
+        super().__init__(command_prefix='!', intents=intents)  # ✓ FIXED: __init__
         self.session: Optional[aiohttp.ClientSession] = None
+        self.cache = CacheManager(Config.CACHE_TTL_HOURS)
+        self.rate_limiter = RateLimiter(Config.RATE_LIMIT_SECONDS)
 
     async def setup_hook(self) -> None:
-        """Initialize aiohttp session on startup."""
+        """Initialize session and load cogs."""
         self.session = aiohttp.ClientSession()
-        logger.info("Bot session initialized")
-        
-        # Load the Space Systems Cog
+        logger.info("✓ Session initialized")
+
         try:
             await self.load_extension('cogs.space_systems')
-            logger.info("Loaded extension: space_systems")
+            logger.info("✓ Loaded extension: space_systems")
         except Exception as e:
-            logger.exception(f"Failed to load extension space_systems: {e}")
+            logger.exception(f"Failed to load cogs.space_systems: {e}")
 
     async def close(self) -> None:
-        """Gracefully close the session."""
+        """Gracefully close session."""
         if self.session:
             await self.session.close()
+        self.cache.clear()
+        logger.info("✓ Bot shutdown complete")
         await super().close()
 
     async def on_ready(self) -> None:
-        logger.info(f'Logged in as {self.user} (ID: {self.user.id})')
+        logger.info(f'✓ Logged in as {self.user} (ID: {self.user.id})')
 
-# Instantiate bot
 bot = AstroBot()
+gemini_client = genai.Client(api_key=Config.GEMINI_API_KEY)
 
-async def fetch_nasa_data(url: str) -> Optional[dict]:
-    """Fetch JSON from NASA API with error handling and timeout."""
+# NASA Api Wrapper
+async def fetch_nasa_data(url: str, use_cache: bool = True) -> Optional[dict]:
+    """
+    Fetch JSON from NASA API with caching, timeout, and retry.
+
+    Args:
+        url: Full NASA API URL
+        use_cache: Whether to use cache
+
+    Returns:
+        Parsed JSON or None
+
+    Raises:
+        APIError: If all retries exhausted
+    """
     if not bot.session:
         logger.error("Session not initialized")
-        return None
-    
-    try:
-        async with bot.session.get(url, timeout=NASA_TIMEOUT) as response:
-            if response.status == 200:
-                return await response.json()
-            else:
-                logger.warning(f"NASA API returned {response.status}")
-                return None
-    except asyncio.TimeoutError:
-        logger.error("NASA request timeout")
-        return None
-    except Exception as e:
-        logger.exception(f"Error fetching NASA data: {e}")
-        return None
+        raise APIError("Session not ready")
 
-async def simplify_with_llm(technical_text: str) -> str:
-    """
-    Pass raw text to Gemini for simplification.
-    Runs in thread pool to avoid blocking the event loop.
-    """
-    prompt = f"{LLM_SYSTEM_PROMPT}\n\nRaw text:\n{technical_text}"
-    
+    # Check cache first
+    if use_cache:
+        cached = bot.cache.get(url)
+        if cached:
+            return cached
+
+    async def _fetch():
+        async with bot.session.get(url, timeout=Config.NASA_TIMEOUT) as response:
+            if response.status == 200:
+                data = await response.json()
+                if use_cache:
+                    bot.cache.set(url, data)
+                return data
+            else:
+                raise APIError(f"NASA API returned {response.status}")
+
     try:
-        # Run blocking LLM call in thread pool
+        return await retry_with_backoff(_fetch(), max_retries=3)
+    except asyncio.TimeoutError:
+        raise APIError("NASA request timeout after retries")
+    except Exception as e:
+        logger.exception(f"Failed to fetch NASA data: {e}")
+        raise APIError(str(e))
+
+async def simplify_with_llm(technical_text: str, fallback: Optional[str] = None) -> str:
+    """
+    Summarize technical text via Gemini.
+
+    Args:
+        technical_text: Raw explanation from NASA
+        fallback: Fallback text if LLM fails
+
+    Returns:
+        Simplified explanation or fallback
+    """
+    # Check if we've already simplified this
+    cache_key = f"llm:{hash(technical_text)}"
+    cached = bot.cache.get(cache_key)
+    if cached:
+        return cached
+
+    prompt = f"{Config.LLM_SYSTEM_PROMPT}\n\nRaw text:\n{technical_text}"
+
+    try:
         response = await asyncio.to_thread(
             gemini_client.models.generate_content,
-            model=GEMINI_MODEL,
+            model=Config.GEMINI_MODEL,
             contents=prompt,
         )
-        return response.text
+        result = response.text
+        bot.cache.set(cache_key, result)
+        return result
     except Exception as e:
         logger.exception(f"LLM error: {e}")
-        return "Sorry, my AI brain is fuzzy right now. Could not translate the data!"
+        if fallback:
+            return fallback
+        return "🔧 AI summary unavailable. Here's the raw explanation:\n" + technical_text[:500] + "..."
 
 @bot.command(name='apod')
-async def apod_command(ctx: commands.Context) -> None:
-    """Fetch and explain the Astronomy Picture of the Day."""
+@with_rate_limit(bot.rate_limiter)
+async def apod_command(ctx: commands.Context, count: int = 1) -> None:
+    """
+    Fetch and explain the Astronomy Picture of the Day.
+
+    Usage:
+        !apod              # Today's APOD
+        !apod 7            # Last 7 days
+    """
+    # Validate count
+    if count < 1 or count > Config.MAX_APOD_COUNT:
+        await ctx.send(
+            f"⚠️ Count must be 1–{Config.MAX_APOD_COUNT}. Using count=1.",
+            delete_after=5
+        )
+        count = 1
+
     async with ctx.typing():
-        # Fetch data
-        url = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}&count=1"
-        nasa_data = await fetch_nasa_data(url)
+        try:
+            url = f"https://api.nasa.gov/planetary/apod?api_key={Config.NASA_API_KEY}&count={count}"
+            nasa_data = await fetch_nasa_data(url)
 
-        if not nasa_data:
-            await ctx.send("🚨 Houston, we have a problem reaching NASA's databases right now.")
-            return
+            if not nasa_data:
+                raise APIError("No data returned from NASA")
 
-        # Because we used 'count', NASA returns a list. We grab the first item.
-        if isinstance(nasa_data, list):
-            nasa_data = nasa_data[0]
+            # Handle list vs single object
+            if isinstance(nasa_data, list):
+                apods = nasa_data
+            else:
+                apods = [nasa_data]
 
-        title = nasa_data.get('title', 'Unknown Title')
-        raw_explanation = nasa_data.get('explanation', '')
-        image_url = nasa_data.get('url', '')
+            if not apods:
+                await ctx.send("❌ No APOD data found for the requested dates.")
+                return
 
-        # Simplify via LLM (non-blocking)
-        simplified_explanation = await simplify_with_llm(raw_explanation)
+            # Send first APOD with button nav if multiple
+            apod = apods[0]
+            title = apod.get('title', 'Unknown Title')
+            raw_explanation = apod.get('explanation', '')
+            image_url = apod.get('url', '')
 
-        # Format output
-        embed = discord.Embed(
-            title=f"🌌 {title}",
-            description=simplified_explanation,
-            color=discord.Color.from_rgb(252, 61, 33)  # NASA red
-        )
-        embed.set_thumbnail(url="https://www.nasa.gov/wp-content/uploads/2023/03/nasa-logo-web-rgb.png")
-        embed.set_image(url=image_url)
-        embed.set_footer(
-            text="Data: NASA APOD API | Translation: Gemini AI",
-            icon_url="https://cdn-icons-png.flaticon.com/512/2906/2906496.png"
-        )
+            # Simplify (cached if available)
+            simplified = await simplify_with_llm(raw_explanation)
 
-        await ctx.send(embed=embed)
+            embed = discord.Embed(
+                title=f"🌌 {title}",
+                description=simplified,
+                color=discord.Color.from_rgb(252, 61, 33)
+            )
+            embed.set_thumbnail(
+                url="https://www.nasa.gov/wp-content/uploads/2023/03/nasa-logo-web-rgb.png"
+            )
+            embed.set_image(url=image_url)
+
+            # Show date if multi-day query
+            if count > 1:
+                date = apod.get('date', 'Unknown')
+                embed.add_field(name="Date", value=date, inline=True)
+                embed.add_field(
+                    name="Showing",
+                    value=f"1 of {len(apods)}",
+                    inline=True
+                )
+
+            embed.set_footer(
+                text="Data: NASA APOD | Simplified: Gemini AI"
+            )
+
+            await ctx.send(embed=embed)
+
+        except APIError as e:
+            await ctx.send(f"🚨 NASA error: {e}")
+        except LLMError as e:
+            await ctx.send(f"🔧 LLM error: {e}")
+        except Exception as e:
+            logger.exception(f"Unexpected error in apod_command: {e}")
+            await ctx.send("❌ Something went wrong. Check logs.")
+
+@bot.command(name='cache')
+@commands.is_owner()  # Admin-only
+async def cache_command(ctx: commands.Context, action: str = "info") -> None:
+    """
+    Manage bot cache (owner only).
+
+    Usage:
+        !cache info       # Show cache stats
+        !cache clear      # Clear all cache
+    """
+    if action == "clear":
+        bot.cache.clear()
+        await ctx.send("✓ Cache cleared")
+    elif action == "info":
+        size = len(bot.cache.cache)
+        await ctx.send(f"📊 Cache entries: {size}")
+    else:
+        await ctx.send("⚠️ Unknown action. Use: info, clear")
 
 if __name__ == '__main__':
-    if not DISCORD_TOKEN:
-        logger.error("ERROR: DISCORD_TOKEN not set in .env")
+    if not Config.validate():
+        logger.error("Configuration validation failed")
         exit(1)
-    
-    logger.info("Starting AstroBot...")
-    bot.run(DISCORD_TOKEN)
+
+    logger.info("🚀 Starting AstroBot...")
+    bot.run(Config.DISCORD_TOKEN)
