@@ -11,10 +11,7 @@ from functools import wraps
 from google import genai
 from dotenv import load_dotenv
 from discord.ui import Button, View
-
-
-
-
+from utils.favorites import favorites_manager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -246,6 +243,8 @@ async def retry_with_backoff(coro, max_retries: int = 3, base_delay: float = 1.0
             logger.warning(f"Attempt {attempt + 1} failed, retrying in {delay}s: {e}")
             await asyncio.sleep(delay)
 
+bot.help_command = None  # Disable default help
+
 class AstroBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -439,6 +438,116 @@ async def apod_command(ctx: commands.Context, count: int = 1) -> None:
             logger.exception(f"Unexpected error in apod_command: {e}")
             await ctx.send("❌ Something went wrong. Check logs.")
 
+@bot.command(name='save_apod')
+async def save_apod_command(ctx: commands.Context, date: str = None) -> None:
+    """
+    Save current or specified APOD to your favorites.
+
+    Usage:
+        !save_apod              # Save today's APOD
+        !save_apod 2024-01-15   # Save APOD from specific date
+    """
+    async with ctx.typing():
+        try:
+            # If no date provided, use today
+            if not date:
+                date = datetime.now().strftime('%Y-%m-%d')
+
+            # Fetch APOD
+            url = f"https://api.nasa.gov/planetary/apod?api_key={Config.NASA_API_KEY}&date={date}"
+            apod = await fetch_nasa_data(url)
+
+            if not apod:
+                await ctx.send(f"❌ Could not fetch APOD for {date}")
+                return
+
+            # Try to save
+            added = favorites_manager.add_favorite(ctx.author.id, apod)
+
+            if added:
+                title = apod.get('title', 'Unknown')
+                await ctx.send(f"✅ Saved **{title}** ({date}) to favorites!")
+            else:
+                await ctx.send(f"⚠️ This APOD is already in your favorites.")
+
+        except Exception as e:
+            logger.exception(f"Error in save_apod_command: {e}")
+            await ctx.send("❌ Something went wrong.")
+
+
+@bot.command(name='my_favorites')
+async def my_favorites_command(ctx: commands.Context) -> None:
+    """Show all your saved APODs."""
+    async with ctx.typing():
+        try:
+            favorites = favorites_manager.get_favorites(ctx.author.id)
+
+            if not favorites:
+                await ctx.send("📭 You don't have any saved APODs yet. Use `!save_apod` to add one!")
+                return
+
+            # Create embeds for each favorite
+            embeds = []
+            for fav in favorites:
+                embed = discord.Embed(
+                    title=f"⭐ {fav.get('title', 'Unknown')}",
+                    color=discord.Color.from_rgb(255, 215, 0)
+                )
+                embed.add_field(name="Date", value=fav.get('date'), inline=False)
+                embed.add_field(
+                    name="Saved At",
+                    value=fav.get('favorited_at', 'Unknown').split('T')[0],
+                    inline=False
+                )
+                embed.set_image(url=fav.get('url'))
+                embeds.append(embed)
+
+            # Send first embed with pagination if needed
+            if len(embeds) == 1:
+                await ctx.send(embed=embeds[0])
+            else:
+                view = PaginationView(embeds, ctx.author.id)
+                view.update_buttons()
+                await ctx.send(embed=embeds[0], view=view)
+
+        except Exception as e:
+            logger.exception(f"Error in my_favorites_command: {e}")
+            await ctx.send("❌ Something went wrong.")
+
+@bot.command(name='remove_favorite')
+async def remove_favorite_command(ctx: commands.Context, date: str) -> None:
+    """
+    Remove a saved APOD from favorites.
+
+    Usage:
+        !remove_favorite 2024-01-15
+    """
+    async with ctx.typing():
+        try:
+            removed = favorites_manager.remove_favorite(ctx.author.id, date)
+
+            if removed:
+                await ctx.send(f"✅ Removed APOD from {date} from favorites.")
+            else:
+                await ctx.send(f"❌ APOD from {date} not found in your favorites.")
+
+        except Exception as e:
+            logger.exception(f"Error in remove_favorite_command: {e}")
+            await ctx.send("❌ Something went wrong.")
+
+
+@bot.command(name='clear_favorites')
+async def clear_favorites_command(ctx: commands.Context) -> None:
+    """Permanently clear all your saved APODs."""
+    async with ctx.typing():
+        try:
+            count = favorites_manager.clear_favorites(ctx.author.id)
+            await ctx.send(f"🗑️ Cleared {count} APODs from your favorites.")
+
+        except Exception as e:
+            logger.exception(f"Error in clear_favorites_command: {e}")
+            await ctx.send("❌ Something went wrong.")
+
 @bot.command(name='cache')
 @commands.is_owner()  # Admin-only
 async def cache_command(ctx: commands.Context, action: str = "info") -> None:
@@ -457,6 +566,208 @@ async def cache_command(ctx: commands.Context, action: str = "info") -> None:
         await ctx.send(f"📊 Cache entries: {size}")
     else:
         await ctx.send("⚠️ Unknown action. Use: info, clear")
+
+@bot.command(name='help')
+async def help_command(ctx: commands.Context, topic: str = None) -> None:
+    """
+    Show help for AstroBot commands.
+
+    Usage:
+        !help               # General help
+        !help apod          # Help for APOD
+        !help asteroids     # Help for asteroid tracker
+        !help impact        # Help for impact calculator
+        !help favorites     # Help for favorites
+    """
+    if not topic:
+        # General help
+        embed = discord.Embed(
+            title="🚀 AstroBot Help",
+            description="Explore space with NASA data!",
+            color=discord.Color.from_rgb(70, 130, 180)
+        )
+        embed.add_field(
+            name="📡 APOD Commands",
+            value="`!apod` - Today's Astronomy Picture\n`!apod [count]` - Last N days",
+            inline=False
+        )
+        embed.add_field(
+            name="🪨 Asteroid Commands",
+            value="`!asteroids` - List approaching asteroids\n`!impact [name]` - Calculate impact energy",
+            inline=False
+        )
+        embed.add_field(
+            name="⭐ Favorites Commands",
+            value="`!save_apod [date]` - Save an APOD\n`!my_favorites` - View saved APODs\n`!remove_favorite [date]` - Remove from favorites",
+            inline=False
+        )
+        embed.add_field(
+            name="ℹ️ Info",
+            value="Use `!help [topic]` for detailed command info.\nData: NASA APOD & NEO APIs",
+            inline=False
+        )
+        embed.set_footer(text="Made by AstroBot | v1.0")
+
+        await ctx.send(embed=embed)
+
+    elif topic.lower() == 'apod':
+        embed = discord.Embed(
+            title="📡 APOD Commands",
+            description="Astronomy Picture of the Day",
+            color=discord.Color.from_rgb(252, 61, 33)
+        )
+        embed.add_field(
+            name="!apod",
+            value="Fetch today's APOD with AI-simplified explanation.",
+            inline=False
+        )
+        embed.add_field(
+            name="!apod [count]",
+            value="Fetch last N days (max 30). Use arrow buttons to navigate.",
+            inline=False
+        )
+        embed.add_field(
+            name="Examples",
+            value="`!apod` - Today only\n`!apod 7` - Last 7 days\n`!apod 30` - Last month",
+            inline=False
+        )
+        embed.add_field(
+            name="Features",
+            value="✨ AI simplification for kids\n🎯 Pagination buttons\n💾 Caching (fast repeats)",
+            inline=False
+        )
+
+        await ctx.send(embed=embed)
+
+    elif topic.lower() == 'asteroids':
+        embed = discord.Embed(
+            title="🪨 Asteroid Commands",
+            description="Near-Earth object tracking",
+            color=discord.Color.from_rgb(184, 134, 11)
+        )
+        embed.add_field(
+            name="!asteroids",
+            value="Show 5 approaching near-Earth asteroids.",
+            inline=False
+        )
+        embed.add_field(
+            name="!asteroids [count]",
+            value="Show last N approaching asteroids (max 20).",
+            inline=False
+        )
+        embed.add_field(
+            name="Features",
+            value="🎯 Pagination buttons\n⚠️ Hazard status\n📏 Diameter & velocity\n🚀 Miss distance",
+            inline=False
+        )
+        embed.add_field(
+            name="Examples",
+            value="`!asteroids` - Next 5\n`!asteroids 10` - Next 10",
+            inline=False
+        )
+
+        await ctx.send(embed=embed)
+
+    elif topic.lower() == 'impact':
+        embed = discord.Embed(
+            title="💥 Impact Calculator",
+            description="Calculate asteroid impact energy",
+            color=discord.Color.from_rgb(255, 69, 0)
+        )
+        embed.add_field(
+            name="!impact [name]",
+            value="Calculate kinetic energy, TNT equivalent, and crater size for an asteroid.",
+            inline=False
+        )
+        embed.add_field(
+            name="Output",
+            value="📏 Diameter\n⚡ Kinetic energy (megatons TNT)\n💣 Estimated crater radius\n🔬 Velocity",
+            inline=False
+        )
+        embed.add_field(
+            name="Examples",
+            value="`!impact Apophis`\n`!impact 2024 DW`\n`!impact Bennu`",
+            inline=False
+        )
+        embed.add_field(
+            name="Assumptions",
+            value="Spherical asteroid · Density: 2600 kg/m³ · For reference only",
+            inline=False
+        )
+
+        await ctx.send(embed=embed)
+
+    elif topic.lower() == 'favorites':
+        embed = discord.Embed(
+            title="⭐ Favorites Commands",
+            description="Save your favorite APODs",
+            color=discord.Color.from_rgb(255, 215, 0)
+        )
+        embed.add_field(
+            name="!save_apod",
+            value="Save today's APOD to your favorites.",
+            inline=False
+        )
+        embed.add_field(
+            name="!save_apod [date]",
+            value="Save APOD from specific date (YYYY-MM-DD).",
+            inline=False
+        )
+        embed.add_field(
+            name="!my_favorites",
+            value="View all your saved APODs with pagination.",
+            inline=False
+        )
+        embed.add_field(
+            name="!remove_favorite [date]",
+            value="Remove an APOD from favorites.",
+            inline=False
+        )
+        embed.add_field(
+            name="!clear_favorites",
+            value="⚠️ Permanently delete all saved APODs.",
+            inline=False
+        )
+        embed.add_field(
+            name="Examples",
+            value="`!save_apod` - Save today\n`!save_apod 2024-01-15` - Save specific date\n`!my_favorites` - View all",
+            inline=False
+        )
+
+        await ctx.send(embed=embed)
+
+    else:
+        await ctx.send(f"❓ Unknown topic: `{topic}`. Try `!help` for general help.")
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    """Handle command errors gracefully."""
+
+    if isinstance(error, commands.CommandNotFound):
+        logger.warning(f"Unknown command: {ctx.message.content}")
+        await ctx.send(
+            f"❌ Unknown command. Use `!help` for available commands.",
+            delete_after=5
+        )
+    elif isinstance(error, commands.MissingRequiredArgument):
+        logger.warning(f"Missing argument: {ctx.command}")
+        await ctx.send(
+            f"❌ Missing argument. Use `!help {ctx.command.name}` for usage.",
+            delete_after=5
+        )
+    elif isinstance(error, commands.BadArgument):
+        logger.warning(f"Bad argument: {error}")
+        await ctx.send(
+            f"❌ Invalid argument. Use `!help {ctx.command.name}` for usage.",
+            delete_after=5
+        )
+    else:
+        logger.error(f"Unhandled error in {ctx.command}: {error}", exc_info=error)
+        await ctx.send(
+            f"❌ An error occurred. Check logs for details.",
+            delete_after=5
+        )
 
 if __name__ == '__main__':
     if not Config.validate():

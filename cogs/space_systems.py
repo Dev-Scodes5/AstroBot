@@ -1,130 +1,341 @@
 import discord
 from discord.ext import commands
+from discord.ui import Button, View
 import aiohttp
-import os
-import math
 import logging
+from typing import Optional, List, Dict
 from datetime import datetime
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Module-level constants
-ASTEROID_DENSITY_KG_M3 = 3000  # Rocky asteroid; range ~2700–3500
-TNT_PER_JOULE = 1 / (4.184e15)  # MT TNT = 4.184e15 J
-BUTTON_TIMEOUT_S = 3600
+# Pagination view for asteroids
 
-class ImpactCalculator(discord.ui.View):
-    """Interactive button for kinetic impact energy calculation.
-    Assumes spherical asteroid with rocky density (~3000 kg/m³).
-    Accuracy depends on actual composition and shape.
-    """
-    
-    def __init__(self, velocity_kph: float, diameter_m: float):
-        super().__init__(timeout=BUTTON_TIMEOUT_S)
-        self.velocity_kph = velocity_kph
-        self.diameter_m = diameter_m
-    
-    @discord.ui.button(label="Calculate Kinetic Impact Energy", style=discord.ButtonStyle.danger, emoji="💥")
-    async def calculate_impact(self, interaction: discord.Interaction, button: discord.ui.Button):
-        radius_m = self.diameter_m / 2
-        volume_m3 = (4/3) * math.pi * (radius_m ** 3)
-        mass_kg = volume_m3 * ASTEROID_DENSITY_KG_M3
-        velocity_ms = self.velocity_kph / 3.6
-        kinetic_energy_j = 0.5 * mass_kg * (velocity_ms ** 2)
-        megatons_tnt = kinetic_energy_j * TNT_PER_JOULE
-        
+class AsteroidPaginationView(View):
+    """Navigation buttons for browsing asteroid list."""
+
+    def __init__(self, asteroids: List[Dict], owner_id: int, timeout: int = 300):
+        super().__init__(timeout=timeout)
+        self.asteroids = asteroids
+        self.owner_id = owner_id
+        self.current_index = 0
+
+    def get_embed(self) -> discord.Embed:
+        """Generate embed for current asteroid."""
+        ast = self.asteroids[self.current_index]
+
         embed = discord.Embed(
-            title="💥 Impact Physics Analysis",
-            description="Theoretical energy release if this object impacted Earth.",
-            color=discord.Color.red()
+            title=f"🪨 {ast.get('name', 'Unknown')}",
+            description=f"**Estimated Diameter:** {ast.get('diameter', 'N/A')} m",
+            color=discord.Color.from_rgb(184, 134, 11)
         )
-        embed.add_field(name="Estimated Mass", value=f"{mass_kg:,.0f} kg", inline=True)
-        embed.add_field(name="Impact Velocity", value=f"{velocity_ms:,.0f} m/s", inline=True)
-        embed.add_field(name="Energy Yield", value=f"**{megatons_tnt:,.2f} MT TNT**", inline=False)
-        
-        button.disabled = True
-        await interaction.response.edit_message(view=self)
-        await interaction.followup.send(embed=embed)
+
+        embed.add_field(
+            name="Hazardous",
+            value="⚠️ Yes" if ast.get('hazardous') else "✅ No",
+            inline=True
+        )
+        embed.add_field(
+            name="Relative Velocity",
+            value=f"{ast.get('velocity', 'N/A')} km/s",
+            inline=True
+        )
+        embed.add_field(
+            name="Miss Distance",
+            value=f"{ast.get('miss_distance', 'N/A')} km",
+            inline=False
+        )
+        embed.add_field(
+            name="Close Approach",
+            value=ast.get('close_approach', 'N/A'),
+            inline=False
+        )
+        embed.set_footer(
+            text=f"Asteroid {self.current_index + 1}/{len(self.asteroids)} | "
+                 f"Data: NASA NEO"
+        )
+
+        return embed
+
+    def update_buttons(self) -> None:
+        """Enable/disable buttons based on position."""
+        self.prev_button.disabled = (self.current_index == 0)
+        self.next_button.disabled = (self.current_index == len(self.asteroids) - 1)
+
+    @discord.ui.button(label="◀️ Prev", style=discord.ButtonStyle.primary)
+    async def prev_button(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "❌ You can't control someone else's pagination!",
+                ephemeral=True
+            )
+            return
+
+        if self.current_index > 0:
+            self.current_index -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(
+                embed=self.get_embed(),
+                view=self
+            )
+
+    @discord.ui.button(label="Next ▶️", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "❌ You can't control someone else's pagination!",
+                ephemeral=True
+            )
+            return
+
+        if self.current_index < len(self.asteroids) - 1:
+            self.current_index += 1
+            self.update_buttons()
+            await interaction.response.edit_message(
+                embed=self.get_embed(),
+                view=self
+            )
+
+# Impact Calculator
+
+class ImpactCalculator:
+    """Calculate impact energy and effects for asteroids."""
+
+    # Modeling assumptions
+    ASTEROID_DENSITY = 2600  # kg/m³ (typical rocky asteroid)
+    TNT_EQUIVALENT = 4.184e9  # Joules per ton of TNT
+
+    @staticmethod
+    def calculate_volume(diameter_m: float) -> float:
+        """Calculate volume of spherical asteroid."""
+        import math
+        radius = diameter_m / 2
+        return (4/3) * math.pi * (radius ** 3)
+
+    @staticmethod
+    def calculate_mass(diameter_m: float) -> float:
+        """Calculate mass using density assumption."""
+        volume = ImpactCalculator.calculate_volume(diameter_m)
+        return volume * ImpactCalculator.ASTEROID_DENSITY
+
+    @staticmethod
+    def calculate_kinetic_energy(mass_kg: float, velocity_m_s: float) -> float:
+        """Calculate kinetic energy: KE = 0.5 * m * v²"""
+        return 0.5 * mass_kg * (velocity_m_s ** 2)
+
+    @staticmethod
+    def energy_to_tnt(energy_joules: float) -> float:
+        """Convert energy to TNT equivalent (megatons)."""
+        return energy_joules / ImpactCalculator.TNT_EQUIVALENT / 1e6
+
+    @staticmethod
+    def estimate_crater_radius(energy_megatons: float) -> float:
+        """Rough estimate of crater radius in km (empirical formula)."""
+        # Simplified: crater_radius ≈ 0.066 * (energy^0.33)
+        import math
+        return 0.066 * (energy_megatons ** (1/3))
+
+# Space Systems COG
 
 class SpaceSystems(commands.Cog):
+    """Asteroid tracking and impact calculations."""
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.nasa_key = os.getenv('NASA_API_KEY')
-        if not self.nasa_key:
-            logger.warning("NASA_API_KEY not set; using DEMO_KEY (rate-limited)")
-            self.nasa_key = 'DEMO_KEY'
-    
+        self.nasa_api_key = None
+
+    async def cog_load(self) -> None:
+        """Load NASA API key from bot config."""
+        from main import Config
+        self.nasa_api_key = Config.NASA_API_KEY
+        logger.info("SpaceSystems cog loaded")
+
+    async def fetch_neo_data(self, url: str) -> Optional[Dict]:
+        """Fetch NASA NEO data with error handling."""
+        try:
+            async with self.bot.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    logger.error(f"NASA NEO API returned {response.status}")
+                    return None
+        except asyncio.TimeoutError:
+            logger.error("NEO API timeout")
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching NEO data: {e}")
+            return None
+
+    def parse_asteroids(self, data: Dict) -> List[Dict]:
+        """Parse NASA NEO data into list of asteroid dicts."""
+        asteroids = []
+
+        try:
+            for date, ast_list in data.get('near_earth_objects', {}).items():
+                for ast in ast_list:
+                    try:
+                        diameter_m = (
+                            ast['estimated_diameter']['meters']['estimated_diameter_max'] +
+                            ast['estimated_diameter']['meters']['estimated_diameter_min']
+                        ) / 2
+
+                        close_approaches = ast.get('close_approach_data', [])
+                        if close_approaches:
+                            ca = close_approaches[0]  # First close approach
+                            velocity = float(ca['relative_velocity']['kilometers_per_second'])
+                            miss_dist = float(ca['miss_distance']['kilometers'])
+                            ca_date = ca['close_approach_date']
+                        else:
+                            velocity = 0
+                            miss_dist = 0
+                            ca_date = "N/A"
+
+                        asteroids.append({
+                            'name': ast['name'],
+                            'diameter': round(diameter_m, 2),
+                            'hazardous': ast['is_potentially_hazardous_asteroid'],
+                            'velocity': round(velocity, 2),
+                            'miss_distance': round(miss_dist, 0),
+                            'close_approach': ca_date
+                        })
+                    except (KeyError, ValueError, TypeError) as e:
+                        logger.warning(f"Error parsing asteroid: {e}")
+                        continue
+        except Exception as e:
+            logger.error(f"Error parsing NEO response: {e}")
+
+        return asteroids
+
     @commands.command(name='asteroids')
-    async def asteroid_tracker(self, ctx: commands.Context) -> None:
-        """Fetch and display closest hazardous near-Earth object for today."""
+    async def asteroids_command(self, ctx: commands.Context, count: int = 5) -> None:
+        """
+        Fetch near-Earth asteroids approaching Earth.
+
+        Usage:
+            !asteroids           # Next 5 approaching asteroids
+            !asteroids 10        # Next 10 approaching asteroids
+        """
+        if count < 1 or count > 20:
+            await ctx.send("⚠️ Count must be 1–20. Using count=5.")
+            count = 5
+
         async with ctx.typing():
-            today = datetime.now().strftime('%Y-%m-%d')
-            url = f"https://api.nasa.gov/neo/rest/v1/feed?start_date={today}&end_date={today}&api_key={self.nasa_key}"
-            
             try:
-                async with self.bot.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status != 200:
-                        logger.error(f"NASA API returned {response.status}")
-                        await ctx.send("🚨 Telemetry lost. Cannot reach NASA NeoWs databases.")
-                        return
-                    data = await response.json()
-            except asyncio.TimeoutError:
-                logger.error("NASA API timeout")
-                await ctx.send("⏱️ Request timeout. Try again in a moment.")
-                return
-            except Exception as e:
-                logger.exception(f"Network error fetching asteroids: {e}")
-                await ctx.send(f"Network error: {type(e).__name__}")
-                return
-            
-            asteroids = data.get('near_earth_objects', {}).get(today, [])
-            if not asteroids:
-                await ctx.send("✅ No near-Earth asteroids detected today. The skies are clear!")
-                return
-            
-            # Prefer hazardous asteroid, fallback to closest
-            hazardous = [a for a in asteroids if a.get('is_potentially_hazardous_asteroid')]
-            target = hazardous[0] if hazardous else asteroids[0]
-            
-            # Safely extract telemetry with validation
-            try:
-                name = target.get('name', 'Unknown')
-                diameter_max = float(target['estimated_diameter']['meters']['estimated_diameter_max'])
-                close_approaches = target.get('close_approach_data', [])
-                
-                if not close_approaches:
-                    logger.warning(f"No close approach data for {name}")
-                    await ctx.send(f"⚠️ Asteroid **{name}** has no close approach data today.")
+                url = (
+                    f"https://api.nasa.gov/neo/rest/v1/feed?"
+                    f"start_date={datetime.now().strftime('%Y-%m-%d')}&"
+                    f"api_key={self.nasa_api_key}"
+                )
+
+                data = await self.fetch_neo_data(url)
+                if not data:
+                    await ctx.send("🚨 Failed to fetch asteroid data from NASA.")
                     return
-                
-                speed_kph = float(close_approaches[0]['relative_velocity']['kilometers_per_hour'])
-                miss_distance_km = float(close_approaches[0]['miss_distance']['kilometers'])
-                is_threat = target.get('is_potentially_hazardous_asteroid', False)
-            except (KeyError, ValueError, IndexError) as e:
-                logger.error(f"Malformed NASA response: {e}")
-                await ctx.send("🔴 Could not parse asteroid telemetry. Try again later.")
-                return
-            
-            color = discord.Color.from_rgb(252, 61, 33) if is_threat else discord.Color.green()
-            embed = discord.Embed(
-                title=f"☄️ Orbital Threat Assessment: {name}",
-                description="Live telemetry from NASA CNEOS.",
-                color=color
-            )
-            embed.add_field(name="Estimated Diameter", value=f"{diameter_max:,.2f} m", inline=True)
-            embed.add_field(name="Relative Velocity", value=f"{speed_kph:,.2f} km/h", inline=True)
-            embed.add_field(name="Miss Distance", value=f"{miss_distance_km:,.2f} km", inline=False)
-            embed.add_field(
-                name="Hazard Classification",
-                value="⚠️ Potentially Hazardous" if is_threat else "✅ Safe Trajectory",
-                inline=False
-            )
-            embed.set_footer(text="Data: NASA NeoWs API")
-            
-            view = ImpactCalculator(speed_kph, diameter_max)
-            await ctx.send(embed=embed, view=view)
+
+                asteroids = self.parse_asteroids(data)
+
+                if not asteroids:
+                    await ctx.send("❌ No asteroids found for the requested period.")
+                    return
+
+                asteroids = asteroids[:count]
+
+                view = AsteroidPaginationView(asteroids, ctx.author.id)
+                view.update_buttons()
+
+                embed = view.get_embed()
+                await ctx.send(embed=embed, view=view)
+
+                logger.info(f"Asteroid command: fetched {len(asteroids)} asteroids")
+
+            except Exception as e:
+                logger.exception(f"Error in asteroids_command: {e}")
+                await ctx.send("❌ Something went wrong. Check logs.")
+
+    @commands.command(name='impact')
+    async def impact_command(self, ctx: commands.Context, *, asteroid_name: str) -> None:
+        """
+        Calculate impact energy for a named asteroid.
+
+        Usage:
+            !impact Apophis
+            !impact 2023 DW
+        """
+        async with ctx.typing():
+            try:
+                # Fetch asteroid data
+                url = (
+                    f"https://api.nasa.gov/neo/rest/v1/neo/{asteroid_name}?"
+                    f"api_key={self.nasa_api_key}"
+                )
+
+                data = await self.fetch_neo_data(url)
+                if not data:
+                    await ctx.send(f"❌ Asteroid '{asteroid_name}' not found.")
+                    return
+
+                # Extract data
+                diameter_m = (
+                    data['estimated_diameter']['meters']['estimated_diameter_max'] +
+                    data['estimated_diameter']['meters']['estimated_diameter_min']
+                ) / 2
+
+                close_approaches = data.get('close_approach_data', [])
+                if not close_approaches:
+                    await ctx.send(f"⚠️ No close approach data for '{asteroid_name}'.")
+                    return
+
+                ca = close_approaches[0]
+                velocity_km_s = float(ca['relative_velocity']['kilometers_per_second'])
+                velocity_m_s = velocity_km_s * 1000
+
+                # Calculate
+                mass_kg = ImpactCalculator.calculate_mass(diameter_m)
+                energy_j = ImpactCalculator.calculate_kinetic_energy(mass_kg, velocity_m_s)
+                energy_mt = ImpactCalculator.energy_to_tnt(energy_j)
+                crater_km = ImpactCalculator.estimate_crater_radius(energy_mt)
+
+                # Build embed
+                embed = discord.Embed(
+                    title=f"💥 Impact Analysis: {data['name']}",
+                    color=discord.Color.from_rgb(255, 69, 0)
+                )
+                embed.add_field(
+                    name="Diameter",
+                    value=f"{diameter_m:.0f} m",
+                    inline=True
+                )
+                embed.add_field(
+                    name="Velocity",
+                    value=f"{velocity_km_s:.2f} km/s",
+                    inline=True
+                )
+                embed.add_field(
+                    name="Mass",
+                    value=f"{mass_kg:.2e} kg",
+                    inline=False
+                )
+                embed.add_field(
+                    name="Kinetic Energy",
+                    value=f"{energy_mt:.3f} megatons TNT",
+                    inline=True
+                )
+                embed.add_field(
+                    name="Est. Crater Radius",
+                    value=f"{crater_km:.1f} km",
+                    inline=True
+                )
+                embed.set_footer(
+                    text="Assumes spherical asteroid, average density 2600 kg/m³. For reference only."
+                )
+
+                await ctx.send(embed=embed)
+                logger.info(f"Impact calculation for {asteroid_name}: {energy_mt:.3f} MT")
+
+            except Exception as e:
+                logger.exception(f"Error in impact_command: {e}")
+                await ctx.send("❌ Something went wrong. Check logs.")
 
 async def setup(bot: commands.Bot) -> None:
-    """Load SpaceSystems cog."""
+    """Load this cog into the bot."""
     await bot.add_cog(SpaceSystems(bot))
+    logger.info("SpaceSystems cog registered")
