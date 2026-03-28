@@ -18,7 +18,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 NASA_API_KEY = os.getenv('NASA_API_KEY', 'DEMO_KEY')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GEMINI_MODEL = 'gemini-1.5-flash'
+GEMINI_MODEL = 'gemini-2.5-flash'
 
 # Configure LLM client
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
