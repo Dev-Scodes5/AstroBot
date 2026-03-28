@@ -108,21 +108,22 @@ async def apod_command(ctx: commands.Context) -> None:
         # Fetch data
         url = f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}&count=1"
         nasa_data = await fetch_nasa_data(url)
-        
+
         if not nasa_data:
             await ctx.send("🚨 Houston, we have a problem reaching NASA's databases right now.")
             return
-            
+
         # Because we used 'count', NASA returns a list. We grab the first item.
         if isinstance(nasa_data, list):
             nasa_data = nasa_data[0]
-        
+
         title = nasa_data.get('title', 'Unknown Title')
         raw_explanation = nasa_data.get('explanation', '')
-        
+        image_url = nasa_data.get('url', '')
+
         # Simplify via LLM (non-blocking)
         simplified_explanation = await simplify_with_llm(raw_explanation)
-        
+
         # Format output
         embed = discord.Embed(
             title=f"🌌 {title}",
@@ -135,7 +136,7 @@ async def apod_command(ctx: commands.Context) -> None:
             text="Data: NASA APOD API | Translation: Gemini AI",
             icon_url="https://cdn-icons-png.flaticon.com/512/2906/2906496.png"
         )
-        
+
         await ctx.send(embed=embed)
 
 if __name__ == '__main__':
