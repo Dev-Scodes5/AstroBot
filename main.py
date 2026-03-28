@@ -10,6 +10,11 @@ from typing import Optional, Dict, Any
 from functools import wraps
 from google import genai
 from dotenv import load_dotenv
+from discord.ui import Button, View
+
+
+
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,6 +66,103 @@ class LLMError(Exception):
 class RateLimitError(Exception):
     """User hit rate limit."""
     pass
+
+class APODPaginationView(View):
+    """Navigation buttons for browsing multiple APOD images."""
+
+    def __init__(self, apods: list, owner_id: int, timeout: int = 300):
+        """
+        Args:
+            apods: List of APOD dictionaries from NASA
+            owner_id: Discord user ID (only they can click buttons)
+            timeout: Inactivity timeout in seconds
+        """
+        super().__init__(timeout=timeout)
+        self.apods = apods
+        self.owner_id = owner_id
+        self.current_index = 0
+
+    def get_embed(self) -> discord.Embed:
+        """Generate embed for current image."""
+        apod = self.apods[self.current_index]
+
+        title = apod.get('title', 'Unknown Title')
+        raw_explanation = apod.get('explanation', '')
+        image_url = apod.get('url', '')
+        date = apod.get('date', 'Unknown')
+
+        # We already have simplified text, so use raw for now
+        # (In production, you'd cache this per image)
+        embed = discord.Embed(
+            title=f"🌌 {title}",
+            description=raw_explanation[:400] + "..." if len(raw_explanation) > 400 else raw_explanation,
+            color=discord.Color.from_rgb(252, 61, 33)
+        )
+        embed.set_image(url=image_url)
+        embed.add_field(name="Date", value=date, inline=True)
+        embed.add_field(
+            name="Page",
+            value=f"{self.current_index + 1}/{len(self.apods)}",
+            inline=True
+        )
+        embed.set_footer(text="Data: NASA APOD | Simplified: Gemini AI")
+
+        return embed
+
+    def update_buttons(self) -> None:
+        """Enable/disable buttons based on current position."""
+        # Disable Prev if on first image
+        self.prev_button.disabled = (self.current_index == 0)
+        # Disable Next if on last image
+        self.next_button.disabled = (self.current_index == len(self.apods) - 1)
+
+    @discord.ui.button(label="◀️ Prev", style=discord.ButtonStyle.primary)
+    async def prev_button(self, interaction: discord.Interaction, button: Button) -> None:
+        """Go to previous image."""
+        # Only owner can click
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "❌ You can't control someone else's pagination!",
+                ephemeral=True
+            )
+            return
+
+        if self.current_index > 0:
+            self.current_index -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(
+                embed=self.get_embed(),
+                view=self
+            )
+        else:
+            await interaction.response.send_message(
+                "⏪ Already at first image!",
+                ephemeral=True
+            )
+
+    @discord.ui.button(label="Next ▶️", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: Button) -> None:
+        """Go to next image."""
+        # Only owner can click
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "❌ You can't control someone else's pagination!",
+                ephemeral=True
+            )
+            return
+
+        if self.current_index < len(self.apods) - 1:
+            self.current_index += 1
+            self.update_buttons()
+            await interaction.response.edit_message(
+                embed=self.get_embed(),
+                view=self
+            )
+        else:
+            await interaction.response.send_message(
+                "⏩ Already at last image!",
+                ephemeral=True
+            )
 
 class CacheManager:
     """Simple in-memory cache with TTL."""
@@ -263,7 +365,7 @@ async def apod_command(ctx: commands.Context, count: int = 1) -> None:
 
     Usage:
         !apod              # Today's APOD
-        !apod 7            # Last 7 days
+        !apod 7            # Last 7 days (with navigation buttons)
     """
     # Validate count
     if count < 1 or count > Config.MAX_APOD_COUNT:
@@ -291,13 +393,14 @@ async def apod_command(ctx: commands.Context, count: int = 1) -> None:
                 await ctx.send("❌ No APOD data found for the requested dates.")
                 return
 
-            # Send first APOD with button nav if multiple
+            # Get first APOD
             apod = apods[0]
             title = apod.get('title', 'Unknown Title')
             raw_explanation = apod.get('explanation', '')
             image_url = apod.get('url', '')
+            date = apod.get('date', 'Unknown')
 
-            # Simplify (cached if available)
+            # Simplify via LLM (cached if available)
             simplified = await simplify_with_llm(raw_explanation)
 
             embed = discord.Embed(
@@ -309,22 +412,24 @@ async def apod_command(ctx: commands.Context, count: int = 1) -> None:
                 url="https://www.nasa.gov/wp-content/uploads/2023/03/nasa-logo-web-rgb.png"
             )
             embed.set_image(url=image_url)
+            embed.add_field(name="Date", value=date, inline=True)
 
-            # Show date if multi-day query
-            if count > 1:
-                date = apod.get('date', 'Unknown')
-                embed.add_field(name="Date", value=date, inline=True)
+            # Create pagination view if multiple APODs
+            view = None
+            if len(apods) > 1:
                 embed.add_field(
-                    name="Showing",
+                    name="Pages",
                     value=f"1 of {len(apods)}",
                     inline=True
                 )
+                view = APODPaginationView(apods, ctx.author.id)
+                view.update_buttons()  # Initialize button states
 
             embed.set_footer(
                 text="Data: NASA APOD | Simplified: Gemini AI"
             )
 
-            await ctx.send(embed=embed)
+            await ctx.send(embed=embed, view=view)
 
         except APIError as e:
             await ctx.send(f"🚨 NASA error: {e}")
