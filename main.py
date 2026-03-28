@@ -12,9 +12,6 @@ from google import genai
 from dotenv import load_dotenv
 from discord.ui import Button, View
 
-# Assuming you have this file in your directory
-from utils.favorites import favorites_manager
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
