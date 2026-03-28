@@ -1,442 +1,404 @@
 import discord
 from discord.ext import commands
-from discord.ui import View, Button
 import aiohttp
-import os
+import asyncio
 import logging
+import os
+import json
 from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+from functools import wraps
+from google import genai
 from dotenv import load_dotenv
+from discord.ui import Button, View
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Assuming you have this file in your directory
+from utils.favorites import favorites_manager
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-TOKEN = os.getenv('DISCORD_TOKEN')
-NASA_KEY = os.getenv('NASA_API_KEY')
-GEMINI_KEY = os.getenv('GEMINI_API_KEY')
+class Config:
+    """Centralized config. Easy to audit and override."""
+    DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+    NASA_API_KEY = os.getenv('NASA_API_KEY', 'DEMO_KEY')
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+    GEMINI_MODEL = 'gemini-2.5-flash'
 
-intents = discord.Intents.default()
-intents.message_content = True
+    # Timeouts & Limits
+    NASA_TIMEOUT = aiohttp.ClientTimeout(total=10)
+    CACHE_TTL_HOURS = 24
+    RATE_LIMIT_SECONDS = 5
+    MAX_APOD_COUNT = 30
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+    # Prompts
+    LLM_SYSTEM_PROMPT = """
+You are an enthusiastic astrophysics communicator for high schoolers.
+Take the following highly technical description from NASA and summarize it
+in 2-3 engaging, easy-to-understand paragraphs. Keep it fun but scientifically accurate.
+"""
 
-# Pagination views
+    @staticmethod
+    def validate() -> bool:
+        if not Config.DISCORD_TOKEN:
+            logger.error("DISCORD_TOKEN not set")
+            return False
+        if not Config.GEMINI_API_KEY:
+            logger.error("GEMINI_API_KEY not set")
+            return False
+        return True
+
+class APIError(Exception): pass
+class LLMError(Exception): pass
+class RateLimitError(Exception): pass
+
+# ==================== UI VIEWS ====================
+class PaginationView(View):
+    """Generic navigation buttons for browsing multiple Embeds."""
+    def __init__(self, embeds: list, owner_id: int, timeout: int = 300):
+        super().__init__(timeout=timeout)
+        self.embeds = embeds
+        self.owner_id = owner_id
+        self.current_index = 0
+
+    def update_buttons(self) -> None:
+        self.prev_button.disabled = (self.current_index == 0)
+        self.next_button.disabled = (self.current_index == len(self.embeds) - 1)
+
+    @discord.ui.button(label="◀️ Prev", style=discord.ButtonStyle.primary)
+    async def prev_button(self, interaction: discord.Interaction, button: Button) -> None:
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("❌ You can't control someone else's pagination!", ephemeral=True)
+        if self.current_index > 0:
+            self.current_index -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.embeds[self.current_index], view=self)
+
+    @discord.ui.button(label="Next ▶️", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: Button) -> None:
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("❌ You can't control someone else's pagination!", ephemeral=True)
+        if self.current_index < len(self.embeds) - 1:
+            self.current_index += 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.embeds[self.current_index], view=self)
 
 class APODPaginationView(View):
-    """Pagination view for APOD images."""
-
-    def __init__(self, apod_list, user_id: int, timeout: int = 300):
+    """Navigation buttons for browsing multiple APOD images."""
+    def __init__(self, apods: list, owner_id: int, timeout: int = 300):
         super().__init__(timeout=timeout)
-        self.apod_list = apod_list
+        self.apods = apods
+        self.owner_id = owner_id
         self.current_index = 0
-        self.user_id = user_id
 
-    def get_embed(self):
-        """Generate embed for current APOD."""
-        apod = self.apod_list[self.current_index]
+    def get_embed(self) -> discord.Embed:
+        apod = self.apods[self.current_index]
+        title = apod.get('title', 'Unknown Title')
+        raw_explanation = apod.get('explanation', '')
+        image_url = apod.get('url', '')
+        date = apod.get('date', 'Unknown')
+
         embed = discord.Embed(
-            title=apod.get('title', 'Untitled'),
-            description=apod.get('explanation', 'No explanation available'),
-            color=discord.Color.from_rgb(70, 130, 180)
+            title=f"🌌 {title}",
+            description=raw_explanation[:400] + "..." if len(raw_explanation) > 400 else raw_explanation,
+            color=discord.Color.from_rgb(252, 61, 33)
         )
-
-        if 'url' in apod and apod['url']:
-            embed.set_image(url=apod['url'])
-
-        if 'media_type' in apod:
-            embed.add_field(name="Type", value=apod['media_type'], inline=True)
-
-        if 'copyright' in apod:
-            embed.set_footer(text=f"© {apod['copyright']}")
-
-        embed.add_field(
-            name="Navigation",
-            value=f"Image {self.current_index + 1} of {len(self.apod_list)}",
-            inline=False
-        )
-
+        embed.set_image(url=image_url)
+        embed.add_field(name="Date", value=date, inline=True)
+        embed.add_field(name="Page", value=f"{self.current_index + 1}/{len(self.apods)}", inline=True)
+        embed.set_footer(text="Data: NASA APOD | Simplified: Gemini AI")
         return embed
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        """Ensure only the command user can interact with buttons."""
-        return interaction.user.id == self.user_id
+    def update_buttons(self) -> None:
+        self.prev_button.disabled = (self.current_index == 0)
+        self.next_button.disabled = (self.current_index == len(self.apods) - 1)
 
-    @discord.ui.button(label="⬅️ Previous", style=discord.ButtonStyle.primary)
-    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="◀️ Prev", style=discord.ButtonStyle.primary)
+    async def prev_button(self, interaction: discord.Interaction, button: Button) -> None:
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("❌ You can't control someone else's pagination!", ephemeral=True)
         if self.current_index > 0:
             self.current_index -= 1
-            await interaction.response.edit_message(embed=self.get_embed())
-        else:
-            await interaction.response.defer()
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
-    @discord.ui.button(label="➡️ Next", style=discord.ButtonStyle.primary)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.current_index < len(self.apod_list) - 1:
+    @discord.ui.button(label="Next ▶️", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: Button) -> None:
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("❌ You can't control someone else's pagination!", ephemeral=True)
+        if self.current_index < len(self.apods) - 1:
             self.current_index += 1
-            await interaction.response.edit_message(embed=self.get_embed())
-        else:
-            await interaction.response.defer()
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
-class AsteroidPaginationView(View):
-    """Pagination view for asteroid list."""
+# ==================== DATA & UTILS ====================
+class CacheManager:
+    def __init__(self, ttl_hours: int = 24):
+        self.cache: Dict[str, tuple[Any, datetime]] = {}
+        self.ttl = timedelta(hours=ttl_hours)
 
-    def __init__(self, asteroid_list, user_id: int, timeout: int = 300):
-        super().__init__(timeout=timeout)
-        self.asteroid_list = asteroid_list
-        self.current_index = 0
-        self.user_id = user_id
-
-    def get_embed(self):
-        """Generate embed for current asteroid."""
-        asteroid = self.asteroid_list[self.current_index]
-        embed = discord.Embed(
-            title=asteroid['name'],
-            color=discord.Color.from_rgb(184, 134, 11)
-        )
-
-        # Safely extract data
-        diameter_km = asteroid.get('diameter_km', 'Unknown')
-        velocity_kmh = asteroid.get('velocity_kmh', 'Unknown')
-        hazardous = asteroid.get('hazardous', False)
-        miss_distance = asteroid.get('miss_distance', 'Unknown')
-
-        embed.add_field(name="Diameter (km)", value=str(diameter_km), inline=True)
-        embed.add_field(name="Velocity (km/h)", value=str(velocity_kmh), inline=True)
-        embed.add_field(name="Hazardous", value="⚠️ Yes" if hazardous else "✅ No", inline=True)
-        embed.add_field(name="Miss Distance (km)", value=str(miss_distance), inline=False)
-
-        embed.set_footer(text=f"Asteroid {self.current_index + 1} of {len(self.asteroid_list)}")
-
-        return embed
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        """Ensure only the command user can interact with buttons."""
-        return interaction.user.id == self.user_id
-
-    @discord.ui.button(label="⬅️ Previous", style=discord.ButtonStyle.primary)
-    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.current_index > 0:
-            self.current_index -= 1
-            await interaction.response.edit_message(embed=self.get_embed())
-        else:
-            await interaction.response.defer()
-
-    @discord.ui.button(label="➡️ Next", style=discord.ButtonStyle.primary)
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.current_index < len(self.asteroid_list) - 1:
-            self.current_index += 1
-            await interaction.response.edit_message(embed=self.get_embed())
-        else:
-            await interaction.response.defer()
-
-class ImpactCalculator(View):
-    """Interactive impact calculator view."""
-
-    def __init__(self, asteroid_data, user_id: int):
-        super().__init__(timeout=300)
-        self.asteroid_data = asteroid_data
-        self.user_id = user_id
-
-    def calculate_impact(self):
-        """Calculate impact metrics."""
-        diameter_km = self.asteroid_data.get('diameter_km', 0)
-        velocity_kmh = self.asteroid_data.get('velocity_kmh', 0)
-
-        if diameter_km <= 0 or velocity_kmh <= 0:
+    def get(self, key: str) -> Optional[Any]:
+        if key not in self.cache: return None
+        value, timestamp = self.cache[key]
+        if datetime.now() - timestamp > self.ttl:
+            del self.cache[key]
             return None
+        return value
 
-        # Convert to SI units
-        diameter_m = diameter_km * 1000
-        velocity_ms = velocity_kmh / 3.6
+    def set(self, key: str, value: Any) -> None:
+        self.cache[key] = (value, datetime.now())
 
-        # Spherical asteroid assumption
-        radius_m = diameter_m / 2
-        volume_m3 = (4/3) * 3.14159 * (radius_m ** 3)
-        density_kg_m3 = 2600  # Typical asteroid density
-        mass_kg = volume_m3 * density_kg_m3
+    def clear(self) -> None:
+        self.cache.clear()
 
-        # Kinetic energy: KE = 0.5 * m * v^2
-        kinetic_energy_joules = 0.5 * mass_kg * (velocity_ms ** 2)
+class RateLimiter:
+    def __init__(self, cooldown_seconds: int = 5):
+        self.cooldowns: Dict[int, datetime] = {}
+        self.cooldown = timedelta(seconds=cooldown_seconds)
 
-        # Convert to megatons TNT (1 megaton = 4.184e15 joules)
-        kinetic_energy_megatons = kinetic_energy_joules / 4.184e15
+    def is_on_cooldown(self, user_id: int) -> bool:
+        if user_id not in self.cooldowns: return False
+        if datetime.now() - self.cooldowns[user_id] > self.cooldown:
+            del self.cooldowns[user_id]
+            return False
+        return True
 
-        # Crater radius (rough estimate): r_crater ≈ 0.032 * (energy_mt)^0.33
-        crater_radius_km = 0.032 * (kinetic_energy_megatons ** 0.33)
+    def apply(self, user_id: int) -> None:
+        self.cooldowns[user_id] = datetime.now()
 
-        return {
-            'kinetic_energy_megatons': kinetic_energy_megatons,
-            'crater_radius_km': crater_radius_km,
-            'mass_kg': mass_kg
-        }
+    def remaining(self, user_id: int) -> float:
+        if user_id not in self.cooldowns: return 0
+        remaining = self.cooldown - (datetime.now() - self.cooldowns[user_id])
+        return max(0, remaining.total_seconds())
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return interaction.user.id == self.user_id
+def with_rate_limit(limiter: RateLimiter):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(ctx: commands.Context, *args, **kwargs):
+            user_id = ctx.author.id
+            if limiter.is_on_cooldown(user_id):
+                remaining = limiter.remaining(user_id)
+                await ctx.send(f"⏱️ Slow down! Try again in {remaining:.1f} seconds.", delete_after=5)
+                raise RateLimitError(f"User {user_id} rate-limited")
+            limiter.apply(user_id)
+            return await func(ctx, *args, **kwargs)
+        return wrapper
+    return decorator
 
-    @discord.ui.button(label="Calculate Impact", style=discord.ButtonStyle.danger)
-    async def calculate_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
+async def retry_with_backoff(func, *args, max_retries: int = 3, base_delay: float = 1.0, **kwargs):
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            if attempt == max_retries - 1: raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning(f"Attempt {attempt + 1} failed, retrying in {delay}s: {e}")
+            await asyncio.sleep(delay)
 
-        result = self.calculate_impact()
-        if not result:
-            await interaction.followup.send("❌ Invalid asteroid data for calculation.")
-            return
+# ==================== BOT ====================
+class AstroBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix='!', intents=intents)
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.cache = CacheManager(Config.CACHE_TTL_HOURS)
+        self.rate_limiter = RateLimiter(Config.RATE_LIMIT_SECONDS)
 
-        embed = discord.Embed(
-            title=f"💥 Impact Analysis: {self.asteroid_data['name']}",
-            color=discord.Color.from_rgb(255, 69, 0)
+    async def setup_hook(self) -> None:
+        self.session = aiohttp.ClientSession()
+        try:
+            await self.load_extension('cogs.space_systems')
+        except Exception as e:
+            logger.exception(f"Failed to load cogs.space_systems: {e}")
+
+    async def close(self) -> None:
+        if self.session: await self.session.close()
+        self.cache.clear()
+        await super().close()
+
+    async def on_ready(self) -> None:
+        logger.info(f'Logged in as {self.user}')
+
+bot = AstroBot()
+bot.help_command = None 
+gemini_client = genai.Client(api_key=Config.GEMINI_API_KEY)
+
+async def fetch_nasa_data(url: str, use_cache: bool = True) -> Optional[dict]:
+    if not bot.session: raise APIError("Session not ready")
+    if use_cache:
+        cached = bot.cache.get(url)
+        if cached: return cached
+
+    async def _fetch():
+        async with bot.session.get(url, timeout=Config.NASA_TIMEOUT) as response:
+            if response.status == 200:
+                data = await response.json()
+                if use_cache: bot.cache.set(url, data)
+                return data
+            raise APIError(f"NASA API returned {response.status}")
+    try:
+        return await retry_with_backoff(_fetch, max_retries=3)
+    except asyncio.TimeoutError:
+        raise APIError("NASA request timeout after retries")
+    except Exception as e:
+        raise APIError(str(e))
+
+async def simplify_with_llm(technical_text: str, fallback: Optional[str] = None) -> str:
+    cache_key = f"llm:{hash(technical_text)}"
+    cached = bot.cache.get(cache_key)
+    if cached: return cached
+
+    prompt = f"{Config.LLM_SYSTEM_PROMPT}\n\nRaw text:\n{technical_text}"
+    try:
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=Config.GEMINI_MODEL,
+            contents=prompt,
         )
-        embed.add_field(
-            name="Kinetic Energy",
-            value=f"{result['kinetic_energy_megatons']:.2f} megatons TNT",
-            inline=False
-        )
-        embed.add_field(
-            name="Estimated Crater Radius",
-            value=f"{result['crater_radius_km']:.2f} km",
-            inline=False
-        )
-        embed.add_field(
-            name="Asteroid Diameter",
-            value=f"{self.asteroid_data['diameter_km']:.2f} km",
-            inline=True
-        )
-        embed.add_field(
-            name="Impact Velocity",
-            value=f"{self.asteroid_data['velocity_kmh']:.0f} km/h",
-            inline=True
-        )
-        embed.add_field(
-            name="⚠️ Assumptions",
-            value="Spherical asteroid · Density: 2600 kg/m³ · For reference only",
-            inline=False
-        )
+        result = response.text
+        bot.cache.set(cache_key, result)
+        return result
+    except Exception as e:
+        if fallback: return fallback
+        return "🔧 AI summary unavailable. Here's the raw explanation:\n" + technical_text[:500] + "..."
 
-        await interaction.followup.send(embed=embed)
+# ==================== COMMANDS ====================
+@bot.command(name='apod')
+@with_rate_limit(bot.rate_limiter)
+async def apod_command(ctx: commands.Context, count: int = 1) -> None:
+    if count < 1 or count > Config.MAX_APOD_COUNT:
+        await ctx.send(f"⚠️ Count must be 1–{Config.MAX_APOD_COUNT}. Using count=1.", delete_after=5)
+        count = 1
 
-# Bot events
+    async with ctx.typing():
+        try:
+            url = f"https://api.nasa.gov/planetary/apod?api_key={Config.NASA_API_KEY}&count={count}"
+            nasa_data = await fetch_nasa_data(url)
+            if not nasa_data: raise APIError("No data returned from NASA")
+
+            apods = nasa_data if isinstance(nasa_data, list) else [nasa_data]
+            if not apods: return await ctx.send("❌ No APOD data found.")
+
+            apod = apods[0]
+            simplified = await simplify_with_llm(apod.get('explanation', ''))
+
+            embed = discord.Embed(
+                title=f"🌌 {apod.get('title', 'Unknown Title')}",
+                description=simplified,
+                color=discord.Color.from_rgb(252, 61, 33)
+            )
+            embed.set_thumbnail(url="https://www.nasa.gov/wp-content/uploads/2023/03/nasa-logo-web-rgb.png")
+            embed.set_image(url=apod.get('url', ''))
+            embed.add_field(name="Date", value=apod.get('date', 'Unknown'), inline=True)
+
+            view = None
+            if len(apods) > 1:
+                embed.add_field(name="Pages", value=f"1 of {len(apods)}", inline=True)
+                view = APODPaginationView(apods, ctx.author.id)
+                view.update_buttons()
+
+            embed.set_footer(text="Data: NASA APOD | Simplified: Gemini AI")
+            await ctx.send(embed=embed, view=view)
+
+        except Exception as e:
+            await ctx.send(f"❌ Error: {e}")
+
+@bot.command(name='save_apod')
+async def save_apod_command(ctx: commands.Context, date: str = None) -> None:
+    async with ctx.typing():
+        try:
+            if not date: date = datetime.now().strftime('%Y-%m-%d')
+            url = f"https://api.nasa.gov/planetary/apod?api_key={Config.NASA_API_KEY}&date={date}"
+            apod = await fetch_nasa_data(url)
+            if not apod: return await ctx.send(f"❌ Could not fetch APOD for {date}")
+
+            added = favorites_manager.add_favorite(ctx.author.id, apod)
+            if added:
+                await ctx.send(f"✅ Saved **{apod.get('title', 'Unknown')}** ({date}) to favorites!")
+            else:
+                await ctx.send(f"⚠️ This APOD is already in your favorites.")
+        except Exception as e:
+            await ctx.send("❌ Something went wrong.")
+
+@bot.command(name='my_favorites')
+async def my_favorites_command(ctx: commands.Context) -> None:
+    async with ctx.typing():
+        try:
+            favorites = favorites_manager.get_favorites(ctx.author.id)
+            if not favorites:
+                return await ctx.send("📭 You don't have any saved APODs yet.")
+
+            embeds = []
+            for fav in favorites:
+                embed = discord.Embed(title=f"⭐ {fav.get('title', 'Unknown')}", color=discord.Color.from_rgb(255, 215, 0))
+                embed.add_field(name="Date", value=fav.get('date'), inline=False)
+                embed.add_field(name="Saved At", value=fav.get('favorited_at', 'Unknown').split('T')[0], inline=False)
+                embed.set_image(url=fav.get('url'))
+                embeds.append(embed)
+
+            if len(embeds) == 1:
+                await ctx.send(embed=embeds[0])
+            else:
+                view = PaginationView(embeds, ctx.author.id)
+                view.update_buttons()
+                await ctx.send(embed=embeds[0], view=view)
+
+        except Exception as e:
+            await ctx.send("❌ Something went wrong.")
+
+@bot.command(name='remove_favorite')
+async def remove_favorite_command(ctx: commands.Context, date: str) -> None:
+    async with ctx.typing():
+        try:
+            removed = favorites_manager.remove_favorite(ctx.author.id, date)
+            if removed: await ctx.send(f"✅ Removed APOD from {date} from favorites.")
+            else: await ctx.send(f"❌ APOD from {date} not found in your favorites.")
+        except Exception as e:
+            await ctx.send("❌ Something went wrong.")
+
+@bot.command(name='clear_favorites')
+async def clear_favorites_command(ctx: commands.Context) -> None:
+    async with ctx.typing():
+        try:
+            count = favorites_manager.clear_favorites(ctx.author.id)
+            await ctx.send(f"🗑️ Cleared {count} APODs from your favorites.")
+        except Exception as e:
+            await ctx.send("❌ Something went wrong.")
+
+@bot.command(name='cache')
+@commands.is_owner()
+async def cache_command(ctx: commands.Context, action: str = "info") -> None:
+    if action == "clear":
+        bot.cache.clear()
+        await ctx.send("✓ Cache cleared")
+    elif action == "info":
+        await ctx.send(f"📊 Cache entries: {len(bot.cache.cache)}")
+    else:
+        await ctx.send("⚠️ Unknown action. Use: info, clear")
+
+@bot.command(name='help')
+async def help_command(ctx: commands.Context, topic: str = None) -> None:
+    embed = discord.Embed(title="🚀 AstroBot Help", color=discord.Color.from_rgb(70, 130, 180))
+    if not topic:
+        embed.description = "Explore space with NASA data!"
+        embed.add_field(name="📡 APOD", value="`!apod`", inline=False)
+        embed.add_field(name="⭐ Favorites", value="`!save_apod`, `!my_favorites`, `!clear_favorites`", inline=False)
+    else:
+        embed.description = f"Help topic for: {topic}"
+    await ctx.send(embed=embed)
 
 @bot.event
-async def on_ready():
-    """Bot startup handler."""
-    logger.info(f"Logged in as {bot.user}")
-    # Optionally set activity
-    # await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.playing, name="!help"))
-
-# Apod Command
-
-@bot.command(name='apod')
-async def apod_command(ctx: commands.Context, count: int = 1) -> None:
-    """
-    Fetch NASA Astronomy Picture of the Day.
-
-    Usage:
-        !apod          # Today's APOD
-        !apod 7        # Last 7 days
-    """
-    try:
-        if count < 1 or count > 30:
-            await ctx.send("❌ Count must be between 1 and 30.")
-            return
-
-        async with ctx.typing():
-            # Calculate date range
-            end_date = datetime.now().date()
-            start_date = end_date - timedelta(days=count - 1)
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"https://api.nasa.gov/planetary/apod",
-                    params={
-                        'api_key': NASA_KEY,
-                        'start_date': start_date.isoformat(),
-                        'end_date': end_date.isoformat()
-                    },
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status != 200:
-                        await ctx.send(f"❌ NASA API error: {resp.status}")
-                        return
-
-                    apod_list = await resp.json()
-
-                    # Ensure it's a list
-                    if isinstance(apod_list, dict):
-                        apod_list = [apod_list]
-
-            if not apod_list:
-                await ctx.send("❌ No APOD data available.")
-                return
-
-            # Create pagination view
-            view = APODPaginationView(apod_list, ctx.author.id)
-            embed = view.get_embed()
-
-            await ctx.send(embed=embed, view=view)
-
-    except asyncio.TimeoutError:
-        await ctx.send("❌ NASA API request timed out.")
-    except Exception as e:
-        logger.error(f"APOD command error: {e}")
-        await ctx.send("❌ An error occurred fetching APOD data.")
-
-# Asteroids command
-
-@bot.command(name='asteroids')
-async def asteroids_command(ctx: commands.Context, count: int = 5) -> None:
-    """
-    Fetch approaching near-Earth asteroids.
-
-    Usage:
-        !asteroids      # Next 5 asteroids
-        !asteroids 10   # Next 10 asteroids
-    """
-    try:
-        if count < 1 or count > 20:
-            await ctx.send("❌ Count must be between 1 and 20.")
-            return
-
-        async with ctx.typing():
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"https://api.nasa.gov/neo/rest/v1/neo/browse",
-                    params={'api_key': NASA_KEY},
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status != 200:
-                        await ctx.send(f"❌ NASA API error: {resp.status}")
-                        return
-
-                    data = await resp.json()
-                    neo_objects = data.get('near_earth_objects', [])
-
-            if not neo_objects:
-                await ctx.send("❌ No asteroid data available.")
-                return
-
-            # Limit to requested count
-            neo_objects = neo_objects[:count]
-
-            # Process asteroid data
-            asteroid_list = []
-            for neo in neo_objects:
-                diameter_km = 0
-                if 'estimated_diameter' in neo and 'kilometers' in neo['estimated_diameter']:
-                    diameter_km = neo['estimated_diameter']['kilometers']['estimated_diameter_max']
-
-                velocity_kmh = 0
-                hazardous = neo.get('is_potentially_hazardous_asteroid', False)
-                miss_distance = "Unknown"
-
-                # Try to get velocity from close approach data
-                if 'close_approach_data' in neo and neo['close_approach_data']:
-                    approach = neo['close_approach_data'][0]
-                    if 'relative_velocity' in approach and 'kilometers_per_hour' in approach['relative_velocity']:
-                        velocity_kmh = float(approach['relative_velocity']['kilometers_per_hour'])
-                    if 'miss_distance' in approach and 'kilometers' in approach['miss_distance']:
-                        miss_distance = float(approach['miss_distance']['kilometers'])
-
-                asteroid_list.append({
-                    'name': neo.get('name', 'Unknown'),
-                    'diameter_km': diameter_km,
-                    'velocity_kmh': velocity_kmh,
-                    'hazardous': hazardous,
-                    'miss_distance': miss_distance
-                })
-
-            # Create pagination view
-            view = AsteroidPaginationView(asteroid_list, ctx.author.id)
-            embed = view.get_embed()
-
-            await ctx.send(embed=embed, view=view)
-
-    except asyncio.TimeoutError:
-        await ctx.send("❌ NASA API request timed out.")
-    except Exception as e:
-        logger.error(f"Asteroids command error: {e}")
-        await ctx.send("❌ An error occurred fetching asteroid data.")
-
-@bot.command(name='impact')
-async def impact_command(ctx: commands.Context, *, name: str) -> None:
-    """
-    Calculate impact energy for an asteroid.
-
-    Usage:
-        !impact Apophis
-        !impact Bennu
-    """
-    try:
-        async with ctx.typing():
-            async with aiohttp.ClientSession() as session:
-                # Search for asteroid
-                async with session.get(
-                    f"https://api.nasa.gov/neo/rest/v1/neo/sentry/{name}",
-                    params={'api_key': NASA_KEY},
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status != 200:
-                        # Try browse endpoint
-                        async with session.get(
-                            f"https://api.nasa.gov/neo/rest/v1/neo/browse",
-                            params={'api_key': NASA_KEY},
-                            timeout=aiohttp.ClientTimeout(total=10)
-                        ) as browse_resp:
-                            if browse_resp.status != 200:
-                                await ctx.send(f"❌ Asteroid '{name}' not found.")
-                                return
-
-                            data = await browse_resp.json()
-                            neo_objects = data.get('near_earth_objects', [])
-
-                            # Search for asteroid by name
-                            asteroid = None
-                            for neo in neo_objects:
-                                if name.lower() in neo.get('name', '').lower():
-                                    asteroid = neo
-                                    break
-
-                            if not asteroid:
-                                await ctx.send(f"❌ Asteroid '{name}' not found.")
-                                return
-                    else:
-                        asteroid = await resp.json()
-
-            # Extract data
-            diameter_km = 0
-            if 'estimated_diameter' in asteroid and 'kilometers' in asteroid['estimated_diameter']:
-                diameter_km = asteroid['estimated_diameter']['kilometers']['estimated_diameter_max']
-
-            velocity_kmh = 0
-            if 'close_approach_data' in asteroid and asteroid['close_approach_data']:
-                approach = asteroid['close_approach_data'][0]
-                if 'relative_velocity' in approach and 'kilometers_per_hour' in approach['relative_velocity']:
-                    velocity_kmh = float(approach['relative_velocity']['kilometers_per_hour'])
-
-            asteroid_data = {
-                'name': asteroid.get('name', 'Unknown'),
-                'diameter_km': diameter_km,
-                'velocity_kmh': velocity_kmh
-            }
-
-            # Show impact calculator
-            view = ImpactCalculator(asteroid_data, ctx.author.id)
-            embed = discord.Embed(
-                title=f"🪨 {asteroid_data['name']}",
-                description="Click 'Calculate Impact' to see impact metrics.",
-                color=discord.Color.from_rgb(255, 69, 0)
-            )
-            embed.add_field(name="Diameter", value=f"{asteroid_data['diameter_km']:.2f} km", inline=True)
-            embed.add_field(name="Velocity", value=f"{asteroid_data['velocity_kmh']:.0f} km/h", inline=True)
-
-            await ctx.send(embed=embed, view=view)
-
-    except asyncio.TimeoutError:
-        await ctx.send("❌ NASA API request timed out.")
-    except Exception as e:
-        logger.error(f"Impact command error: {e}")
-        await ctx.send("❌ An error occurred processing impact data.")
+async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    if isinstance(error, commands.CommandNotFound): return
+    if isinstance(error, RateLimitError): return # We already sent a message in the decorator
+    await ctx.send("❌ An error occurred with your command. Check usage with `!help`.", delete_after=5)
 
 if __name__ == '__main__':
-    bot.run(TOKEN)
+    if not Config.validate(): exit(1)
+    bot.run(Config.DISCORD_TOKEN)
