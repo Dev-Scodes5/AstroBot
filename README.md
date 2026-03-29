@@ -23,13 +23,9 @@ enter the directory:
 ```bash
 cd AstroBot
 ```
-install required libs:
+install the required libraries:
 ```bash
-pip install discord.py aiohttp python-dotenv google-generativeai
-```
-if you get errors with ```google-generativeai```, try:
-```bash
-pip install google-genai
+pip install -r requirements.txt
 ```
 
 
@@ -103,4 +99,14 @@ In your Discord server:
 ### Clear all favorites:
 ```
 !clear_favorites
+```
+
+### Track near-Earth asteroids:
+```
+!asteroids
+```
+
+### Calculate asteroid impact energy:
+```
+!impact Apophis
 ```
